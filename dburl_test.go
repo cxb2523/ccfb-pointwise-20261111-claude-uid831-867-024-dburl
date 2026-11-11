@@ -1,0 +1,2491 @@
+package dburl
+
+import (
+	"errors"
+	"io/fs"
+	"net/url"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestNoDependencies checks that the module requires nothing outside the
+// standard library.
+//
+// golangci-lint enforces the same rule through depguard, and this test
+// repeats it because `go test` is the one command that runs on every change.
+func TestNoDependencies(t *testing.T) {
+	buf, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	var block bool
+	for i, line := range strings.Split(string(buf), "\n") {
+		s := strings.TrimSpace(line)
+		switch {
+		case s == "", strings.HasPrefix(s, "//"):
+		case block && s == ")":
+			block = false
+		case block, strings.HasPrefix(s, "require "), strings.HasPrefix(s, "replace "):
+			t.Errorf("go.mod:%d: expected no dependency, got: %q", i+1, s)
+		case s == "require (", s == "replace (":
+			block = true
+		}
+	}
+}
+
+// TestSchemeMetadata checks that every registered scheme describes itself.
+//
+// The metadata exists so that this registry can generate its own driver table
+// rather than having usql generate it. A scheme missing a field is a row usql
+// cannot render. See D17.
+func TestSchemeMetadata(t *testing.T) {
+	schemes := BaseSchemes()
+	dialects := make(map[string]string, len(schemes))
+	for _, scheme := range schemes {
+		dialects[scheme.Name] = scheme.Dialect
+	}
+	for _, scheme := range schemes {
+		// file is a pseudo scheme that resolves paths on disk, and has no
+		// database and no driver behind it
+		if scheme.Name == "file" {
+			continue
+		}
+		if scheme.Desc == "" {
+			t.Errorf("%s: expected a Desc, got: %q", scheme.Name, scheme.Desc)
+		}
+		if scheme.Deployment == 0 {
+			t.Errorf("%s: expected a Deployment, got: %d", scheme.Name, scheme.Deployment)
+		}
+		// k8s is a forward to a database that dbfwd finds out, so it has no
+		// product and no Dialect (D73)
+		if scheme.Name == "k8s" {
+			if scheme.Dialect != "" {
+				t.Errorf("%s: expected no Dialect, got: %q", scheme.Name, scheme.Dialect)
+			}
+			continue
+		}
+		if scheme.Dialect == "" {
+			t.Errorf("%s: expected a Dialect, got: %q", scheme.Name, scheme.Dialect)
+		}
+		// a Dialect names a registered scheme, and that scheme is canonical
+		// for its product, so it names itself
+		if _, ok := dialects[scheme.Dialect]; !ok {
+			t.Errorf("%s: Dialect %q is not a registered scheme", scheme.Name, scheme.Dialect)
+		} else if d := dialects[scheme.Dialect]; d != scheme.Dialect {
+			t.Errorf("%s: Dialect %q itself has Dialect %q", scheme.Name, scheme.Dialect, d)
+		}
+		if scheme.GoPackage == "" {
+			t.Errorf("%s: expected a GoPackage, got: %q", scheme.Name, scheme.GoPackage)
+		}
+		if scheme.DriverURL == "" {
+			t.Errorf("%s: expected a DriverURL, got: %q", scheme.Name, scheme.DriverURL)
+		}
+	}
+}
+
+// TestEveryDecisionIsIndexed checks that the table at the top of
+// docs/PLAN.md lists every decision written below it, and nothing else.
+//
+// A decision log rots when an entry is added and the index is not. See D10.
+func TestEveryDecisionIsIndexed(t *testing.T) {
+	buf, err := os.ReadFile("docs/PLAN.md")
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	indexed, written := make(map[string]bool), make(map[string]bool)
+	for _, line := range strings.Split(string(buf), "\n") {
+		switch {
+		case strings.HasPrefix(line, "| [D"):
+			indexed[line[3:strings.Index(line, "]")]] = true
+		case strings.HasPrefix(line, "### D"):
+			written[line[4:strings.Index(line, ".")]] = true
+		}
+	}
+	for d := range written {
+		if !indexed[d] {
+			t.Errorf("D%s is written but not in the index", d)
+		}
+	}
+	for d := range indexed {
+		if !written[d] {
+			t.Errorf("D%s is in the index but not written", d)
+		}
+	}
+}
+
+func TestNormalize(t *testing.T) {
+	tests := []struct {
+		s   string
+		cut int
+		exp string
+	}{
+		{`postgres://crate@127.0.0.1:5432/doc`, 3, `postgres:127.0.0.1:5432:doc:crate`},
+		{`postgres://127.0.0.1:5432/doc`, 3, `postgres:127.0.0.1:5432:doc`},
+		{`postgres://crate@127.0.0.1:5432`, 3, `postgres:127.0.0.1:5432::crate`},
+		{`postgres://127.0.0.1`, 3, `postgres:127.0.0.1:`},
+		{`postgres://127.0.0.1`, 0, `postgres:127.0.0.1:::`},
+		{`mysql://user@host/db`, 0, `mysql:host::db:user`},
+	}
+	for _, test := range tests {
+		t.Run(test.s, func(t *testing.T) {
+			u, err := Parse(test.s)
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+			if s := u.Normalize(":", "", test.cut); s != test.exp {
+				t.Errorf("expected %q, got: %q", test.exp, s)
+			}
+		})
+	}
+}
+
+func TestParseDialect(t *testing.T) {
+	// SchemeName is the scheme, Driver is the name for sql.Open, and Dialect
+	// is the product (D37)
+	tests := []struct {
+		s, scheme, driver, dialect string
+	}{
+		{`postgres://host/db`, "postgres", "pgx", "postgres"},
+		{`pgx://host/db`, "pgx", "pgx", "postgres"},
+		{`pq://host/db`, "pq", "postgres", "postgres"},
+		{`cr://host/db`, "cockroachdb", "pgx", "cockroachdb"},
+		{`ct://host/db`, "cratedb", "pgx", "cratedb"},
+		{`crate://host/db`, "cratedb", "pgx", "cratedb"},
+		{`rs://host/db`, "redshift", "pgx", "redshift"},
+		{`mysql://host/db`, "mysql", "mysql", "mysql"},
+		{`tidb://host/db`, "tidb", "mysql", "tidb"},
+		{`memsql://host/db`, "memsql", "mysql", "memsql"},
+		{`vt://host/db`, "vitess", "mysql", "vitess"},
+		{`questdb://host/qdb`, "questdb", "pgx", "questdb"},
+		{`qs://host/qdb`, "questdb", "pgx", "questdb"},
+		{`pinot://host`, "pinot", "pinot", "pinot"},
+		{`rqlite://host`, "rqlite", "rqlite", "rqlite"},
+		{`turso://host`, "libsql", "libsql", "libsql"},
+		{`phoenix://host`, "avatica", "avatica", "avatica"},
+		{`dr://host`, "druid", "druid", "druid"},
+		{`dl://host`, "drill", "drill", "drill"},
+		{`cql://host`, "cassandra", "cassandra", "cassandra"},
+		{`cass://host`, "cassandra", "cassandra", "cassandra"},
+		{`scylla://host`, "cassandra", "cassandra", "cassandra"},
+		{`solr://host`, "solr", "solr", "solr"},
+		{`so://host`, "solr", "solr", "solr"},
+		{`es://host`, "elasticsearch", "elasticsearch", "elasticsearch"},
+		{`os://host`, "opensearch", "opensearch", "opensearch"},
+		{`elastic://host`, "elasticsearch", "elasticsearch", "elasticsearch"},
+		{`open://host`, "opensearch", "opensearch", "opensearch"},
+		{`trino://host`, "trino", "trino", "trino"},
+		{`presto://host`, "presto", "trino", "presto"},
+		{`moderncsqlite:file.db`, "moderncsqlite", "sqlite", "sqlite3"},
+		{`oracle://user:pass@host/service`, "oracle", "oracle", "oracle"},
+		{`arango://host/db`, "arangodb", "arangodb", "arangodb"},
+		{`influxdb://host/db`, "influxdb", "influxdb", "influxdb"},
+		{`influxql://host/db`, "influxql", "influxdb", "influxql"},
+		{`cosmos://u:a2V5@host/db`, "cosmos", "cosmos", "cosmos"},
+		{`cm://u:a2V5@host/db`, "cosmos", "cosmos", "cosmos"},
+		{`athena://host`, "athena", "athena", "athena"},
+		{`awsathena://host`, "athena", "athena", "athena"},
+		{`bq://host`, "bigquery", "bigquery", "bigquery"},
+		// file: resolves to the scheme of the file, and takes its Dialect
+		{`file:fake.sqlite3`, "sqlite3", "sqlite3", "sqlite3"},
+		{`file:/var/run/postgresql`, "postgres", "pgx", "postgres"},
+	}
+	for _, test := range tests {
+		t.Run(test.s, func(t *testing.T) {
+			u, err := Parse(test.s)
+			if err != nil {
+				t.Fatalf("expected no error, got: %v", err)
+			}
+			if u.SchemeName != test.scheme {
+				t.Errorf("expected scheme %q, got: %q", test.scheme, u.SchemeName)
+			}
+			if u.Driver != test.driver {
+				t.Errorf("expected driver %q, got: %q", test.driver, u.Driver)
+			}
+			if u.Dialect != test.dialect {
+				t.Errorf("expected dialect %q, got: %q", test.dialect, u.Dialect)
+			}
+		})
+	}
+}
+
+func TestDialectProtocols(t *testing.T) {
+	tests := []struct {
+		name string
+		exp  []string
+	}{
+		{"postgres", []string{"libpq", "pg", "pgsql", "pgx", "postgres", "postgresql", "pq", "px"}},
+		{"pq", []string{"libpq", "pg", "pgsql", "pgx", "postgres", "postgresql", "pq", "px"}},
+		{"redshift", []string{"redshift", "rs"}},
+		{"tidb", []string{"ti", "tidb"}},
+		{"cockroachdb", []string{"cdb", "cockroach", "cockroachdb", "cr", "crdb"}},
+		{"cratedb", []string{"crate", "cratedb", "ct"}},
+		{"file", []string{"file", "fi"}},
+		{"unknown", nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if v := DialectProtocols(test.name); !slices.Equal(v, test.exp) {
+				t.Errorf("expected %v, got: %v", test.exp, v)
+			}
+		})
+	}
+	// a product that speaks the wire protocol of mysql has a dialect of its
+	// own, so the mysql family holds only mysql (D37)
+	v := DialectProtocols("mysql")
+	for _, name := range []string{"tidb", "vitess", "memsql"} {
+		if slices.Contains(v, name) {
+			t.Errorf("expected no %q in %v", name, v)
+		}
+	}
+	if !slices.Contains(v, "mysql") {
+		t.Errorf("expected %q in %v", "mysql", v)
+	}
+}
+
+func TestBadParse(t *testing.T) {
+	tests := []struct {
+		s   string
+		exp error
+	}{
+		{``, ErrInvalidDatabaseScheme},
+		{` `, ErrInvalidDatabaseScheme},
+		{`pgsqlx://`, ErrUnknownDatabaseScheme},
+		{`m`, ErrInvalidDatabaseScheme},
+		{`pg+udp://user:pass@localhost/dbname`, ErrInvalidTransportProtocol},
+		{`sqlite+unix://`, ErrInvalidTransportProtocol},
+		{`sqlite+tcp://`, ErrInvalidTransportProtocol},
+		{`file+tcp://`, ErrInvalidTransportProtocol},
+		{`file://`, ErrMissingPath},
+		{`mssql+tcp://user:pass@host/dbname`, ErrInvalidTransportProtocol},
+		{`mssql+foobar://`, ErrInvalidTransportProtocol},
+		{`mssql+unix:/var/run/mssql.sock`, ErrInvalidTransportProtocol},
+		{`mssql+udp:localhost:155`, ErrInvalidTransportProtocol},
+		{`mysql+foo+bar://host/dbname`, ErrInvalidTransportProtocol},
+		{`memsql:/var/run/mysqld/mysqld.sock`, ErrInvalidTransportProtocol},
+		{`tidb:/var/run/mysqld/mysqld.sock`, ErrInvalidTransportProtocol},
+		{`spanner://host/p/db`, ErrMissingPath},
+		{`surrealdb://`, ErrMissingPath},
+		{`surrealdb://host/ns`, ErrMissingPath},
+		{`sr://host//db`, ErrMissingPath},
+		{`awsathena://`, ErrMissingHost},
+		// Parse reads no host with a path as a socket, before the generator
+		{`athena:///db?region=us-east-1`, ErrInvalidTransportProtocol},
+		{`bigquery://`, ErrMissingHost},
+		{`cosmos://`, ErrMissingHost},
+		{`databricks://`, ErrMissingHost},
+		{`databricks://token@host/wh`, ErrMissingUser},
+		{`databricks://token:pat@host`, ErrMissingPath},
+		{`cosmos://u@host/db`, ErrMissingUser},
+		{`gocosmos://key@host/db`, ErrUnknownDatabaseScheme},
+		{`bq:///dataset`, ErrInvalidTransportProtocol},
+		{`spanner+unix:///p/i/db`, ErrInvalidTransportProtocol},
+		{`spanner+tcp://host/p/i/db`, ErrInvalidTransportProtocol},
+		{`spanner://host/p/i/db/x`, ErrMissingPath},
+		{`vitess:/var/run/mysqld/mysqld.sock`, ErrInvalidTransportProtocol},
+		{`memsql+unix:///var/run/mysqld/mysqld.sock`, ErrInvalidTransportProtocol},
+		{`tidb+unix:///var/run/mysqld/mysqld.sock`, ErrInvalidTransportProtocol},
+		{`vitess+unix:///var/run/mysqld/mysqld.sock`, ErrInvalidTransportProtocol},
+		{`cockroach:/var/run/postgresql`, ErrInvalidTransportProtocol},
+		{`cratedb:/var/run/postgresql`, ErrInvalidTransportProtocol},
+		{`ct+unix:/var/run/postgresql`, ErrInvalidTransportProtocol},
+		{`cockroach+unix:/var/run/postgresql`, ErrInvalidTransportProtocol},
+		{`cockroach:./path`, ErrInvalidTransportProtocol},
+		{`cockroach+unix:./path`, ErrInvalidTransportProtocol},
+		{`redshift:/var/run/postgresql`, ErrInvalidTransportProtocol},
+		{`redshift+unix:/var/run/postgresql`, ErrInvalidTransportProtocol},
+		{`redshift:./path`, ErrInvalidTransportProtocol},
+		{`redshift+unix:./path`, ErrInvalidTransportProtocol},
+		{`pg:./path/to/socket`, ErrRelativePathNotSupported}, // relative paths are not possible for postgres sockets
+		{`pg+unix:./path/to/socket`, ErrRelativePathNotSupported},
+		{`snowflake://`, ErrMissingHost},
+		{`sf://`, ErrMissingHost},
+		{`snowflake://account`, ErrMissingUser},
+		{`snowflake://user@account`, ErrMissingUser},
+		{`snowflake://user:@account`, ErrMissingUser},
+		{`sf://account`, ErrMissingUser},
+		{`mq+unix://`, ErrInvalidTransportProtocol},
+		{`mq+tcp://`, ErrInvalidTransportProtocol},
+		{`ots+tcp://`, ErrInvalidTransportProtocol},
+		{`tablestore+tcp://`, ErrInvalidTransportProtocol},
+		{`mc+tcp://id:key@host/p`, ErrInvalidTransportProtocol},
+		{`mc+https://id:key@host/p`, ErrInvalidTransportProtocol},
+		{`maxcompute+http://id:key@host/p`, ErrInvalidTransportProtocol},
+		{`ots+https://user:pass@host/instance`, ErrInvalidTransportProtocol},
+		{`tablestore+http://user:pass@host/instance`, ErrInvalidTransportProtocol},
+		{`mc://`, ErrMissingHost},
+		{`mc://id:key@host`, ErrMissingPath},
+		{`mc://id:key@host/`, ErrMissingPath},
+		{`mc://id@host/p`, ErrMissingUser},
+		{`mc://id:@host/p`, ErrMissingUser},
+		{`mc://host/p`, ErrMissingUser},
+		{`maxcompute://:key@host/p`, ErrMissingUser},
+		{`ots://`, ErrMissingHost},
+		{`ots://user:pass@host`, ErrMissingPath},
+		{`tablestore://user@host/i`, ErrMissingUser},
+		{`tablestore://host/i`, ErrMissingUser},
+		{`yds://host`, ErrUnknownDatabaseScheme},
+		{`ydbs://host`, ErrUnknownDatabaseScheme},
+		{`ydb://host?tls=`, ErrInvalidQuery},
+		{`maxcompute+unix:/var/run/mc.sock`, ErrInvalidTransportProtocol},
+		{`prs://admin@host/catalogname`, ErrUnknownDatabaseScheme},
+		{`prestos://admin@host/catalogname`, ErrUnknownDatabaseScheme},
+		{`prestodbs://admin:pass@host:9998/catalogname`, ErrUnknownDatabaseScheme},
+		{`nzgo://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`nz://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`netezza://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`tdengine://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`td://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`trs://admin@host/catalogname`, ErrUnknownDatabaseScheme},
+		{`trinos://admin@host/catalogname`, ErrUnknownDatabaseScheme},
+		{`ql:file.db`, ErrUnknownDatabaseScheme},
+		{`cznic:file.db`, ErrUnknownDatabaseScheme},
+		{`cznicql:file.db`, ErrUnknownDatabaseScheme},
+		{`mymysql://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`zm://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`mymy://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`adodb://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`ad://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`ado://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`oleodbc://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`odbc://user:pass@host/dbname`, ErrMissingDriver},
+		{`k8s+://pod.ns/db`, ErrInvalidTransportProtocol},
+		{`k8s:///db`, ErrMissingHost},
+		{`k8s+postgres:///db`, ErrMissingHost},
+		{`k8s+tcp://pod.ns/db`, ErrInvalidTransportProtocol},
+		{`k8s+unix://pod.ns/db`, ErrInvalidTransportProtocol},
+		{`exasol://`, ErrMissingUser},
+		{`exa://host`, ErrMissingUser},
+		{`godror://user:pass@host/sid`, ErrUnknownDatabaseScheme},
+		{`gr://user:pass@host/sid`, ErrUnknownDatabaseScheme},
+		{`dynamodb://host?region=r`, ErrMissingUser},
+		{`dynamodb://user@host?region=r`, ErrMissingUser},
+		{`godynamo://user:pass@host?region=r`, ErrUnknownDatabaseScheme},
+		{`dynamodb+http://user:pass@host?region=r`, ErrInvalidTransportProtocol},
+		{`drill+http://host`, ErrInvalidTransportProtocol},
+		{`solr+https://host/c`, ErrInvalidTransportProtocol},
+		{`es+http://host`, ErrInvalidTransportProtocol},
+		{`opensearch+tcp://host`, ErrInvalidTransportProtocol},
+		{`clickhouse+https://host/db`, ErrInvalidTransportProtocol},
+		{`clickhouse+http://host/db`, ErrInvalidTransportProtocol},
+		{`oo://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`ole://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`tds://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`ax://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`ase://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`sapase://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`ignite://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`ig://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`gridgain://user:pass@host/dbname`, ErrUnknownDatabaseScheme},
+		{`unknown_file.ext3`, ErrInvalidDatabaseScheme},
+		{`file:fake.unknown`, ErrUnknownFileHeader},
+		{`file:unknown_file.ext3`, ErrUnknownFileExtension},
+	}
+	for i, test := range tests {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			testBadParse(t, test.s, test.exp)
+		})
+	}
+}
+
+func testBadParse(t *testing.T, s string, exp error) {
+	t.Helper()
+	_, err := Parse(s)
+	switch {
+	case err == nil:
+		t.Errorf("%q expected error nil error, got: %v", s, err)
+	case !errors.Is(err, exp):
+		t.Errorf("%q expected error %v, got: %v", s, exp, err)
+	}
+}
+
+func TestIsDuckdbHeader(t *testing.T) {
+	tests := []struct {
+		name string
+		buf  string
+		exp  bool
+	}{
+		{"real", "\x06\xd7\x6f\x27\xc2\xda\xb3\xb9DUCK\x40\x00\x00\x00", true},
+		{"multibyte checksum", "\xc2\xda\xc2\xda\xc2\xda\xc2\xdaDUCK\x00\x00\x00\x00", true},
+		{"newline checksum", "\x01\x02\x0a\x04\x05\x06\x07\x08DUCK\x00\x00\x00\x00", true},
+		{"ascii checksum", "12345678DUCK87654321", true},
+		{"exactly magic", "12345678DUCK", true},
+		{"short", "12345678DUC", false},
+		{"empty", "", false},
+		{"magic misaligned", "123456789DUCK7654321", false},
+		{"no magic", "1234567887654321....", false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if v := isDuckdbHeader([]byte(test.buf)); v != test.exp {
+				t.Errorf("expected %t, got: %t", test.exp, v)
+			}
+		})
+	}
+}
+
+func TestParse(t *testing.T) {
+	OdbcIgnoreQueryPrefixes = []string{"usql_"}
+	tests := []struct {
+		s    string
+		d    string
+		exp  string
+		path string
+	}{
+		{
+			`pg:`,
+			`pgx`,
+			`postgres://`,
+			``,
+		},
+		{
+			`pg://`,
+			`pgx`,
+			`postgres://`,
+			``,
+		},
+		{
+			`pg:user:pass@localhost/booktest`,
+			`pgx`,
+			`postgres://user:pass@localhost/booktest`,
+			``,
+		},
+		{
+			`pg://user:p%20ss@host/db`,
+			`pgx`,
+			`postgres://user:p%20ss@host/db`,
+			``,
+		},
+		{
+			`pg://user:it%27s@host/db`,
+			`pgx`,
+			`postgres://user:it%27s@host/db`,
+			``,
+		},
+		{
+			`pg://user:a%5Cb@host/db`,
+			`pgx`,
+			`postgres://user:a%5Cb@host/db`,
+			``,
+		},
+		{
+			`pg://user:a%C2%A0b@host/db`,
+			`pgx`,
+			`postgres://user:a%C2%A0b@host/db`,
+			``,
+		},
+		{
+			`pg://user:a=b@host/db`,
+			`pgx`,
+			`postgres://user:a%3Db@host/db`,
+			``,
+		},
+		{
+			`pg://host/my%20db?application_name=my%20app`,
+			`pgx`,
+			`postgres://host/my%20db?application_name=my%20app`,
+			``,
+		},
+		{
+			`pq:`,
+			`postgres`,
+			``,
+			``,
+		},
+		{
+			`pq://user:pass@localhost/booktest`,
+			`postgres`,
+			`dbname=booktest host=localhost password=pass user=user`,
+			``,
+		},
+		{
+			`libpq://user:p%20ss@host:5433/db?sslmode=verify-ca`,
+			`postgres`,
+			`dbname=db host=host password='p ss' port=5433 sslmode=verify-ca user=user`,
+			``,
+		},
+		{
+			`pgsql://user:pass@localhost/booktest`,
+			`pgx`,
+			`postgres://user:pass@localhost/booktest`,
+			``,
+		},
+		{
+			`postgresql://user:pass@localhost/booktest`,
+			`pgx`,
+			`postgres://user:pass@localhost/booktest`,
+			``,
+		},
+		{
+			`pq://user:it%27s@host/db`,
+			`postgres`,
+			`dbname=db host=host password='it\'s' user=user`,
+			``,
+		},
+		{
+			`pq://user:a%5Cb@host/db`,
+			`postgres`,
+			`dbname=db host=host password='a\\b' user=user`,
+			``,
+		},
+		{
+			`pq://user:a%C2%A0b@host/db`,
+			`postgres`,
+			`dbname=db host=host password='a b' user=user`,
+			``,
+		},
+		{
+			`pq://host/my%20db?application_name=my%20app`,
+			`postgres`,
+			`application_name='my app' dbname='my db' host=host`,
+			``,
+		},
+		{
+			`pq:/var/run/postgresql:6666/mydb`,
+			`postgres`,
+			`dbname=mydb host=/var/run/postgresql port=6666`,
+			``,
+		},
+		{
+			`pg:/var/run/postgresql`,
+			`pgx`,
+			`postgres://?host=%2Fvar%2Frun%2Fpostgresql`,
+			`/var/run/postgresql`,
+		},
+		{
+			`pg:/var/run/postgresql:6666/mydb`,
+			`pgx`,
+			`postgres:///mydb?host=%2Fvar%2Frun%2Fpostgresql&port=6666`,
+			`/var/run/postgresql`,
+		},
+		{
+			`/var/run/postgresql:6666/mydb`,
+			`pgx`,
+			`postgres:///mydb?host=%2Fvar%2Frun%2Fpostgresql&port=6666`,
+			`/var/run/postgresql`,
+		},
+		{
+			`pg:/var/run/postgresql/mydb`,
+			`pgx`,
+			`postgres:///mydb?host=%2Fvar%2Frun%2Fpostgresql`,
+			`/var/run/postgresql`,
+		},
+		{
+			`/var/run/postgresql/mydb`,
+			`pgx`,
+			`postgres:///mydb?host=%2Fvar%2Frun%2Fpostgresql`,
+			`/var/run/postgresql`,
+		},
+		{
+			`pg:/var/run/postgresql:7777`,
+			`pgx`,
+			`postgres://?host=%2Fvar%2Frun%2Fpostgresql&port=7777`,
+			`/var/run/postgresql`,
+		},
+		{
+			`pg+unix:/var/run/postgresql:4444/booktest`,
+			`pgx`,
+			`postgres:///booktest?host=%2Fvar%2Frun%2Fpostgresql&port=4444`,
+			`/var/run/postgresql`,
+		},
+		{
+			`/var/run/postgresql:7777`,
+			`pgx`,
+			`postgres://?host=%2Fvar%2Frun%2Fpostgresql&port=7777`,
+			`/var/run/postgresql`,
+		},
+		{
+			`pg:user:pass@/var/run/postgresql/mydb`,
+			`pgx`,
+			`postgres://user:pass@/mydb?host=%2Fvar%2Frun%2Fpostgresql`,
+			`/var/run/postgresql`,
+		},
+		{
+			`pg:user:pass@/really/bad/path`,
+			`pgx`,
+			`postgres://user:pass@?host=%2Freally%2Fbad%2Fpath`,
+			``,
+		},
+		{
+			`my:`,
+			`mysql`,
+			`tcp(localhost)/?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`my://`,
+			`mysql`,
+			`tcp(localhost)/?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`my:booktest:booktest@localhost/booktest`,
+			`mysql`,
+			`booktest:booktest@tcp(localhost)/booktest?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`my:/var/run/mysqld/mysqld.sock/mydb?timeout=90`,
+			`mysql`,
+			`unix(/var/run/mysqld/mysqld.sock)/mydb?loc=Local&parseTime=true&sql_mode=ansi&timeout=90`,
+			`/var/run/mysqld/mysqld.sock`,
+		},
+		{
+			`/var/run/mysqld/mysqld.sock/mydb?timeout=90`,
+			`mysql`,
+			`unix(/var/run/mysqld/mysqld.sock)/mydb?loc=Local&parseTime=true&sql_mode=ansi&timeout=90`,
+			`/var/run/mysqld/mysqld.sock`,
+		},
+		{
+			`my:///var/run/mysqld/mysqld.sock/mydb?timeout=90`,
+			`mysql`,
+			`unix(/var/run/mysqld/mysqld.sock)/mydb?loc=Local&parseTime=true&sql_mode=ansi&timeout=90`,
+			`/var/run/mysqld/mysqld.sock`,
+		},
+		{
+			`my+unix:user:pass@mysqld.sock?timeout=90`,
+			`mysql`,
+			`user:pass@unix(mysqld.sock)/?loc=Local&parseTime=true&sql_mode=ansi&timeout=90`,
+			``,
+		},
+		{
+			`my:./path/to/socket`,
+			`mysql`,
+			`unix(path/to/socket)/?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`my+unix:./path/to/socket`,
+			`mysql`,
+			`unix(path/to/socket)/?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`mssql://`,
+			`sqlserver`,
+			`sqlserver://localhost`,
+			``,
+		},
+		{
+			`mssql://user:pass@localhost/dbname`,
+			`sqlserver`,
+			`sqlserver://user:pass@localhost/?database=dbname`,
+			``,
+		},
+		{
+			`mssql://user@localhost/service/dbname`,
+			`sqlserver`,
+			`sqlserver://user@localhost/service?database=dbname`,
+			``,
+		},
+		{
+			`mssql://user:!234%23$@localhost:1580/dbname`,
+			`sqlserver`,
+			`sqlserver://user:%21234%23$@localhost:1580/?database=dbname`,
+			``,
+		},
+		{
+			`mssql://user:!234%23$@localhost:1580/service/dbname?fedauth=true`,
+			`azuresql`,
+			`sqlserver://user:%21234%23$@localhost:1580/service?database=dbname&fedauth=true`,
+			``,
+		},
+		{
+			`azuresql://user:pass@localhost:100/dbname`,
+			`azuresql`,
+			`sqlserver://user:pass@localhost:100/?database=dbname`,
+			``,
+		},
+		{
+			`sqlserver://xxx.database.windows.net?database=xxx&fedauth=ActiveDirectoryMSI`,
+			`azuresql`,
+			`sqlserver://xxx.database.windows.net?database=xxx&fedauth=ActiveDirectoryMSI`,
+			``,
+		},
+		{
+			`azuresql://user:pass@myserver/dbname`,
+			`azuresql`,
+			`sqlserver://user:pass@myserver.database.windows.net/?database=dbname`,
+			``,
+		},
+		{
+			`azuresql://user:pass@MyServer.Database.Windows.NET/dbname`,
+			`azuresql`,
+			`sqlserver://user:pass@MyServer.Database.Windows.NET/?database=dbname`,
+			``,
+		},
+		{
+			`sqlserver://user:pass@myserver/dbname?fedauth=ActiveDirectoryMSI`,
+			`azuresql`,
+			`sqlserver://user:pass@myserver.database.windows.net/?database=dbname&fedauth=ActiveDirectoryMSI`,
+			``,
+		},
+		{
+			`sqlserver://user:pass@myserver/dbname`,
+			`sqlserver`,
+			`sqlserver://user:pass@myserver/?database=dbname`,
+			``,
+		},
+		{
+			`azuresql://xxx.database.windows.net/dbname?fedauth=ActiveDirectoryMSI`,
+			`azuresql`,
+			`sqlserver://xxx.database.windows.net/?database=dbname&fedauth=ActiveDirectoryMSI`,
+			``,
+		},
+		{
+			`k8s://pod.ns/db`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`k://pg-rw.prod/`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`k8s+postgres://user:pass@pod.ns/db?context=prod`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`k8s+cnpg://svc.ns:5432/db`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`k+mysql://pod/db?namespace=ns&secret=s`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`kc+cnpg://secret:field@c.ns/db`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`kube+postgres://c.ns/db`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`kubernetes+cnpg://c.ns/db`,
+			`k8s`,
+			``,
+			``,
+		},
+		{
+			`odbc+Postgres+Unicode://user:pass@host:5432/dbname?not_ignored=1`,
+			`odbc`,
+			`odbc+Postgres+Unicode://user:pass@host:5432/dbname?not_ignored=1`,
+			``,
+		},
+		{
+			`odbc+Postgres+Unicode://user:pass@host:5432/dbname?usql_ignore=1&not_ignored=1`,
+			`odbc`,
+			`odbc+Postgres+Unicode://user:pass@host:5432/dbname?not_ignored=1`,
+			``,
+		},
+		{
+			`odbc+ODBC+Driver+18+for+SQL+Server://sa:p%3Bw@host/inst/dbname`,
+			`odbc`,
+			`odbc+ODBC+Driver+18+for+SQL+Server://sa:p;w@host/inst/dbname`,
+			``,
+		},
+		{
+			`odbc+sqlite:/home/ken/a.db`,
+			`odbc`,
+			`odbc+sqlite:///home/ken/a.db`,
+			``,
+		},
+		{
+			`odbc+SQLite3:///tmp/x.db`,
+			`odbc`,
+			`odbc+SQLite3:///tmp/x.db`,
+			``,
+		},
+		{
+			`odbc+sqlite3:///tmp/x.db`,
+			`odbc`,
+			`odbc+sqlite3:///tmp/x.db`,
+			``,
+		},
+		{
+			`odbc+SQLite3+ODBC+Driver:///tmp/x.db`,
+			`odbc`,
+			`odbc+SQLite3+ODBC+Driver:///tmp/x.db`,
+			``,
+		},
+		{
+			`odbc+duckdb:///tmp/x.duckdb`,
+			`odbc`,
+			`odbc+duckdb:///tmp/x.duckdb`,
+			``,
+		},
+		{
+			`sqlite:///path/to/file.sqlite3`,
+			`sqlite3`,
+			`/path/to/file.sqlite3?_loc=auto`,
+			``,
+		},
+		{
+			`sq://path/to/file.sqlite3`,
+			`sqlite3`,
+			`path/to/file.sqlite3?_loc=auto`,
+			``,
+		},
+		{
+			`sq:path/to/file.sqlite3`,
+			`sqlite3`,
+			`path/to/file.sqlite3?_loc=auto`,
+			``,
+		},
+		{
+			`sq:./path/to/file.sqlite3`,
+			`sqlite3`,
+			`./path/to/file.sqlite3?_loc=auto`,
+			``,
+		},
+		{
+			`sq://./path/to/file.sqlite3?loc=auto`,
+			`sqlite3`,
+			`./path/to/file.sqlite3?_loc=auto&loc=auto`,
+			``,
+		},
+		{
+			`sq::memory:?loc=auto`,
+			`sqlite3`,
+			`:memory:?_loc=auto&loc=auto`,
+			``,
+		},
+		{
+			`sq://:memory:?loc=auto`,
+			`sqlite3`,
+			`:memory:?_loc=auto&loc=auto`,
+			``,
+		},
+		{
+			`or://user:pass@localhost:3000/servicename`,
+			`oracle`,
+			`oracle://user:pass@localhost:3000/servicename`,
+			``,
+		},
+		{
+			`or://localhost`,
+			`oracle`,
+			`oracle://localhost:1521`,
+			``,
+		},
+		{
+			`oracle://user:pass@localhost`,
+			`oracle`,
+			`oracle://user:pass@localhost:1521`,
+			``,
+		},
+		{
+			`oracle://user:pass@localhost/service_name/instance_name`,
+			`oracle`,
+			`oracle://user:pass@localhost:1521/service_name/instance_name`,
+			``,
+		},
+		{
+			`oracle://user:pass@localhost:2000/xe.oracle.docker`,
+			`oracle`,
+			`oracle://user:pass@localhost:2000/xe.oracle.docker`,
+			``,
+		},
+		{
+			`or://username:password@host/ORCL`,
+			`oracle`,
+			`oracle://username:password@host:1521/ORCL`,
+			``,
+		},
+		{
+			`odpi://username:password@sales-server:1521/sales.us.acme.com`,
+			`oracle`,
+			`oracle://username:password@sales-server:1521/sales.us.acme.com`,
+			``,
+		},
+		{
+			`oracle://user:pass@host/svc?server=a:1&server=b:2&sid=xe`,
+			`oracle`,
+			`oracle://user:pass@host:1521/svc?server=a:1&server=b:2&sid=xe`,
+			``,
+		},
+		{
+			`oracle://user:p%40ss@host/svc/inst?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem`,
+			`oracle`,
+			`oracle://user:p%40ss@host:1521/svc/inst?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem`,
+			``,
+		},
+		{
+			`oracle://user:pass@host/a%2Fb/inst`,
+			`oracle`,
+			`oracle://user:pass@host:1521/a%2Fb/inst`,
+			``,
+		},
+		{
+			`oracle://username:password@sales-server.us.acme.com/sales.us.oracle.com`,
+			`oracle`,
+			`oracle://username:password@sales-server.us.acme.com:1521/sales.us.oracle.com`,
+			``,
+		},
+		{
+			`ca://host`,
+			`cassandra`,
+			`cassandra://host?timeout=300s`,
+			``,
+		},
+		{
+			`cassandra://host:9999`,
+			`cassandra`,
+			`cassandra://host:9999?timeout=300s`,
+			``,
+		},
+		{
+			`scy://user@host:9999`,
+			`cassandra`,
+			`cassandra://user@host:9999?timeout=300s`,
+			``,
+		},
+		{
+			`scylla://user@host:9999?timeout=1000`,
+			`cassandra`,
+			`cassandra://user@host:9999?timeout=1000`,
+			``,
+		},
+		{
+			`datastax://user:pass@localhost:9999/?timeout=1000`,
+			`cassandra`,
+			`cassandra://user:pass@localhost:9999/?timeout=1000`,
+			``,
+		},
+		{
+			`ca://user:pass@localhost:9999/dbname?timeout=1000`,
+			`cassandra`,
+			`cassandra://user:pass@localhost:9999/dbname?timeout=1000`,
+			``,
+		},
+		{
+			`sf://user:KEY@org-acct.snowflakecomputing.com/dbname/schema?role=r&warehouse=w&timeout=60s&timezone=UTC`,
+			`snowflake`,
+			`snowflake://user:KEY@org-acct.snowflakecomputing.com/dbname/schema?role=r&warehouse=w&timeout=60s&timezone=UTC`,
+			``,
+		},
+		{
+			`snowflake://user:KEY@org-acct.snowflakecomputing.com`,
+			`snowflake`,
+			`snowflake://user:KEY@org-acct.snowflakecomputing.com`,
+			``,
+		},
+		{
+			`sf://user:KEY@org-acct/dbname?role=r`,
+			`snowflake`,
+			`snowflake://user:KEY@org-acct.snowflakecomputing.com/dbname?role=r`,
+			``,
+		},
+		{
+			`sf://user:KEY@xy12345.us-east-1`,
+			`snowflake`,
+			`snowflake://user:KEY@xy12345.us-east-1.snowflakecomputing.com`,
+			``,
+		},
+		{
+			`sf://user:KEY@Org-Acct.SnowflakeComputing.COM/db`,
+			`snowflake`,
+			`snowflake://user:KEY@Org-Acct.SnowflakeComputing.COM/db`,
+			``,
+		},
+		{
+			`sf://user:KEY@127.0.0.1/db`,
+			`snowflake`,
+			`snowflake://user:KEY@127.0.0.1/db`,
+			``,
+		},
+		{
+			`sf://user:KEY@localhost:9999/dbname`,
+			`snowflake`,
+			`snowflake://user:KEY@localhost:9999/dbname`,
+			``,
+		},
+		{
+			`px://user:pass@host/db?application_name=my%20app`,
+			`pgx`,
+			`postgres://user:pass@host/db?application_name=my%20app`,
+			``,
+		},
+		{
+			`px:/var/run/postgresql:6666/mydb`,
+			`pgx`,
+			`postgres:///mydb?host=%2Fvar%2Frun%2Fpostgresql&port=6666`,
+			``,
+		},
+		{
+			`cr://`,
+			`pgx`,
+			`postgres://localhost:26257?sslmode=disable`,
+			``,
+		},
+		{
+			`cockroachdb://user:pass@host/db`,
+			`pgx`,
+			`postgres://user:pass@host:26257/db?sslmode=disable`,
+			``,
+		},
+		{
+			`cr://user:pass@host:1234/db?sslmode=verify-full&application_name=my%20app`,
+			`pgx`,
+			`postgres://user:pass@host:1234/db?application_name=my%20app&sslmode=verify-full`,
+			``,
+		},
+		{
+			`ct://`,
+			`pgx`,
+			`postgres://localhost`,
+			``,
+		},
+		{
+			`crate://crate@127.0.0.1/doc`,
+			`pgx`,
+			`postgres://crate@127.0.0.1/doc`,
+			``,
+		},
+		{
+			`cratedb://user:pass@host:6543/doc?sslmode=require&application_name=my%20app`,
+			`pgx`,
+			`postgres://user:pass@host:6543/doc?application_name=my%20app&sslmode=require`,
+			``,
+		},
+		{
+			`rs://`,
+			`pgx`,
+			`postgres://localhost:5439`,
+			``,
+		},
+		{
+			`redshift://user:pass@host/db?application_name=my%20app`,
+			`pgx`,
+			`postgres://user:pass@host:5439/db?application_name=my%20app`,
+			``,
+		},
+		{
+			`rs://user:pass@amazon.com/dbname`,
+			`pgx`,
+			`postgres://user:pass@amazon.com:5439/dbname`,
+			``,
+		},
+		{
+			`ve://`,
+			`vertica`,
+			`vertica://localhost:5433/`,
+			``,
+		},
+		{
+			`ve://user:pass@vertica-host/dbvertica?tlsmode=server-strict`,
+			`vertica`,
+			`vertica://user:pass@vertica-host:5433/dbvertica?tlsmode=server-strict`,
+			``,
+		},
+		{
+			`vertica://vertica:P4ssw0rd@localhost/vertica`,
+			`vertica`,
+			`vertica://vertica:P4ssw0rd@localhost:5433/vertica`,
+			``,
+		},
+		{
+			`ve://vertica:P4ssw0rd@localhost:5433/vertica`,
+			`vertica`,
+			`vertica://vertica:P4ssw0rd@localhost:5433/vertica`,
+			``,
+		},
+		{
+			`moderncsqlite:///path/to/file.sqlite3`,
+			`sqlite`,
+			`/path/to/file.sqlite3?_timezone=Local`,
+			``,
+		},
+		{
+			`modernsqlite:///path/to/file.sqlite3`,
+			`sqlite`,
+			`/path/to/file.sqlite3?_timezone=Local`,
+			``,
+		},
+		{
+			`mq://path/to/file.sqlite3`,
+			`sqlite`,
+			`path/to/file.sqlite3?_timezone=Local`,
+			``,
+		},
+		{
+			`mq:path/to/file.sqlite3`,
+			`sqlite`,
+			`path/to/file.sqlite3?_timezone=Local`,
+			``,
+		},
+		{
+			`mq:./path/to/file.sqlite3`,
+			`sqlite`,
+			`./path/to/file.sqlite3?_timezone=Local`,
+			``,
+		},
+		{
+			`mq://./path/to/file.sqlite3?loc=auto`,
+			`sqlite`,
+			`./path/to/file.sqlite3?_timezone=Local&loc=auto`,
+			``,
+		},
+		{
+			`mq::memory:?loc=auto`,
+			`sqlite`,
+			`:memory:?_timezone=Local&loc=auto`,
+			``,
+		},
+		{
+			`mq://:memory:?loc=auto`,
+			`sqlite`,
+			`:memory:?_timezone=Local&loc=auto`,
+			``,
+		},
+		{
+			`pgx://`,
+			`pgx`,
+			`postgres://`,
+			``,
+		},
+		{
+			`cql://user:p%40ss@[::1]:9042/ks?consistency=localQuorum&host=%5B::2%5D:9042&host=h3`,
+			`cassandra`,
+			`cassandra://user:p%40ss@[::1]:9042/ks?consistency=localQuorum&host=%5B::2%5D:9042&host=h3&timeout=300s`,
+			``,
+		},
+		{
+			`cql://host/ks?timeout=10s`,
+			`cassandra`,
+			`cassandra://host/ks?timeout=10s`,
+			``,
+		},
+		{
+			`couchbase://`,
+			`couchbase`,
+			`couchbase://localhost?txtimeout=30m`,
+			``,
+		},
+		{
+			`n1ql://user:pass@host/`,
+			`couchbase`,
+			`couchbase://user:pass@host/?txtimeout=30m`,
+			``,
+		},
+		{
+			`n1://user:pass@host:9093`,
+			`couchbase`,
+			`couchbase://user:pass@host:9093?txtimeout=30m`,
+			``,
+		},
+		{
+			`couchbase://user:p%40ss@host/?tls=true&query_context=default%3Adbmeta._default`,
+			`couchbase`,
+			`couchbase://user:p%40ss@host/?tls=true&query_context=default%3Adbmeta._default&txtimeout=30m`,
+			``,
+		},
+		{
+			`couchbase://[::1]/?scan_consistency=request_plus&timeout=10s`,
+			`couchbase`,
+			`couchbase://[::1]/?scan_consistency=request_plus&timeout=10s&txtimeout=30m`,
+			``,
+		},
+		{
+			`couchbase://host?tls=1`,
+			`couchbase`,
+			`couchbase://host?tls=1&txtimeout=30m`,
+			``,
+		},
+		{
+			`couchbase://host:9000?tls=true`,
+			`couchbase`,
+			`couchbase://host:9000?tls=true&txtimeout=30m`,
+			``,
+		},
+		{
+			`couchbase://host?tls=false`,
+			`couchbase`,
+			`couchbase://host?tls=false&txtimeout=30m`,
+			``,
+		},
+		{
+			`couchbase://host?tls=bogus`,
+			`couchbase`,
+			`couchbase://host?tls=bogus&txtimeout=30m`,
+			``,
+		},
+		{
+			`surrealdb://root:pw@127.0.0.1/dbmeta/dbmeta`,
+			`surrealdb`,
+			`surrealdb://root:pw@127.0.0.1/dbmeta/dbmeta`,
+			``,
+		},
+		{
+			`sr://user:pass@host:9000/ns/db?tls=true`,
+			`surrealdb`,
+			`surrealdb://user:pass@host:9000/ns/db?tls=true`,
+			``,
+		},
+		{
+			`sur://user:p%40ss@host/my%2Fns/db?auth=database&encoding=json`,
+			`surrealdb`,
+			`surrealdb://user:p%40ss@host/my%2Fns/db?auth=database&encoding=json`,
+			``,
+		},
+		{
+			`surreal://[::1]/ns/db`,
+			`surrealdb`,
+			`surrealdb://[::1]/ns/db`,
+			``,
+		},
+		{
+			`neo4j://`,
+			`neo4j`,
+			`neo4j://localhost`,
+			``,
+		},
+		{
+			`nj://neo4j:pw@127.0.0.1/dbmeta`,
+			`neo4j`,
+			`neo4j://neo4j:pw@127.0.0.1/dbmeta`,
+			``,
+		},
+		{
+			`neo://user:pass@host/db?tls=true&cancel=metadata`,
+			`neo4j`,
+			`neo4j://user:pass@host/db?tls=true&cancel=metadata`,
+			``,
+		},
+		{
+			`n4j://user:p%40ss@host:9000/my%2Fdb?tls=1`,
+			`neo4j`,
+			`neo4j://user:p%40ss@host:9000/my%2Fdb?tls=1`,
+			``,
+		},
+		{
+			`neo4j://[::1]/`,
+			`neo4j`,
+			`neo4j://[::1]/`,
+			``,
+		},
+		{
+			`influxdb://`,
+			`influxdb`,
+			`influxdb://localhost`,
+			``,
+		},
+		{
+			`influx://:apiv3_tok@127.0.0.1/dbmeta`,
+			`influxdb`,
+			`influxdb://:apiv3_tok@127.0.0.1/dbmeta`,
+			``,
+		},
+		{
+			`in://user:tok@host:9999/db?sqlmode=require`,
+			`influxdb`,
+			`influxdb://user:tok@host:9999/db?sqlmode=require`,
+			``,
+		},
+		{
+			`influxdb://host/db?sqlmode=allow&version=2`,
+			`influxdb`,
+			`influxdb://host/db?sqlmode=allow&version=2`,
+			``,
+		},
+		{
+			`influxdb://host/db?version=01`,
+			`influxdb`,
+			`influxdb://host/db?version=01`,
+			``,
+		},
+		{
+			`influxql://`,
+			`influxdb`,
+			`influxdb://localhost?sqlmode=disable`,
+			``,
+		},
+		{
+			`iq://:tok@host/db?version=1`,
+			`influxdb`,
+			`influxdb://:tok@host/db?version=1&sqlmode=disable`,
+			``,
+		},
+		{
+			`influxql://host/db?sqlmode=allow`,
+			`influxdb`,
+			`influxdb://host/db?sqlmode=allow`,
+			``,
+		},
+		{
+			`influxql://[::1]:8086/db`,
+			`influxdb`,
+			`influxdb://[::1]:8086/db?sqlmode=disable`,
+			``,
+		},
+		{
+			`arangodb://`,
+			`arangodb`,
+			`arangodb://localhost`,
+			``,
+		},
+		{
+			`ar://root:pw@127.0.0.1/dbmeta`,
+			`arangodb`,
+			`arangodb://root:pw@127.0.0.1/dbmeta`,
+			``,
+		},
+		{
+			`arango://user:p%40ss@host:9000/my%2Fdb?tls=true`,
+			`arangodb`,
+			`arangodb://user:p%40ss@host:9000/my%2Fdb?tls=true`,
+			``,
+		},
+		{
+			`arangodb://[::1]/_system`,
+			`arangodb`,
+			`arangodb://[::1]/_system`,
+			``,
+		},
+		{
+			`tidb://root@host/db`,
+			`mysql`,
+			`root@tcp(host:4000)/db?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`ti://root@host:4001/db`,
+			`mysql`,
+			`root@tcp(host:4001)/db?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`vitess://root@host/db`,
+			`mysql`,
+			`root@tcp(host)/db?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`memsql://root@host/db`,
+			`mysql`,
+			`root@tcp(host)/db?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`hdb://user:pass@host`,
+			`hdb`,
+			`hdb://user:pass@host:30015`,
+			``,
+		},
+		{
+			`hdb://user:pass@host:30113`,
+			`hdb`,
+			`hdb://user:pass@host:30113`,
+			``,
+		},
+		{
+			`spanner://localhost:9010/p/i/db?usePlainText=true`,
+			`spanner`,
+			`spanner://localhost:9010/p/i/db?usePlainText=true`,
+			``,
+		},
+		{
+			`spanner:///p/i/db`,
+			`spanner`,
+			`spanner:///p/i/db`,
+			``,
+		},
+		{
+			`sp://host/p/i/db?a=1&b=2`,
+			`spanner`,
+			`spanner://host/p/i/db?a=1&b=2`,
+			``,
+		},
+		{
+			`questdb://admin:quest@127.0.0.1/qdb`,
+			`pgx`,
+			`postgres://admin:quest@127.0.0.1:8812/qdb`,
+			``,
+		},
+		{
+			`pinot://127.0.0.1`,
+			`pinot`,
+			`pinot://127.0.0.1`,
+			``,
+		},
+		{
+			`rqlite://user:pass@127.0.0.1`,
+			`rqlite`,
+			`rqlite://user:pass@127.0.0.1`,
+			``,
+		},
+		{
+			`databend://`,
+			`databend`,
+			`databend://localhost`,
+			``,
+		},
+		{
+			`dd://root:pw@127.0.0.1:9000/default`,
+			`databend`,
+			`databend://root:pw@127.0.0.1:9000/default`,
+			``,
+		},
+		{
+			`libsql://`,
+			`libsql`,
+			`libsql://localhost`,
+			``,
+		},
+		{
+			`turso://user:tok@db-org.turso.io`,
+			`libsql`,
+			`libsql://user:tok@db-org.turso.io`,
+			``,
+		},
+		{
+			`ls://:tok@127.0.0.1:8080?tls=false`,
+			`libsql`,
+			`libsql://:tok@127.0.0.1:8080?tls=false`,
+			``,
+		},
+		{
+			`avatica://`,
+			`avatica`,
+			`avatica://localhost`,
+			``,
+		},
+		{
+			`av://user:pw@127.0.0.1`,
+			`avatica`,
+			`avatica://user:pw@127.0.0.1`,
+			``,
+		},
+		{
+			`phoenix://admin:p%40s%20s@host:8766?tls=true&auth=basic`,
+			`avatica`,
+			`avatica://admin:p%40s%20s@host:8766?tls=true&auth=basic`,
+			``,
+		},
+		{
+			`avatica://[::1]`,
+			`avatica`,
+			`avatica://[::1]`,
+			``,
+		},
+		{
+			`druid://`,
+			`druid`,
+			`druid://localhost`,
+			``,
+		},
+		{
+			`dr://admin:key@127.0.0.1`,
+			`druid`,
+			`druid://admin:key@127.0.0.1`,
+			``,
+		},
+		{
+			`druid://admin:p%40s%20s@host:8082?tls=true&timezone=UTC&timeout=30s`,
+			`druid`,
+			`druid://admin:p%40s%20s@host:8082?tls=true&timezone=UTC&timeout=30s`,
+			``,
+		},
+		{
+			`druid://[::1]`,
+			`druid`,
+			`druid://[::1]`,
+			``,
+		},
+		{
+			`drill://`,
+			`drill`,
+			`drill://localhost`,
+			``,
+		},
+		{
+			`dl://u:p%40w@host:8048?tls=true&schema=dfs.tmp&autolimit=10`,
+			`drill`,
+			`drill://u:p%40w@host:8048?tls=true&schema=dfs.tmp&autolimit=10`,
+			``,
+		},
+		{
+			`solr://host/coll?mode=facet`,
+			`solr`,
+			`solr://host/coll?mode=facet`,
+			``,
+		},
+		{
+			`solr://u:p@host:8984`,
+			`solr`,
+			`solr://u:p@host:8984`,
+			``,
+		},
+		{
+			`es://elastic:key@host?auth=apikey&fetch_size=500&tls=true`,
+			`elasticsearch`,
+			`elasticsearch://elastic:key@host?auth=apikey&fetch_size=500&tls=true`,
+			``,
+		},
+		{
+			`elasticsearch://`,
+			`elasticsearch`,
+			`elasticsearch://localhost`,
+			``,
+		},
+		{
+			`os://admin:pw@host:9201?tls=true&fetch_size=100`,
+			`opensearch`,
+			`opensearch://admin:pw@host:9201?tls=true&fetch_size=100`,
+			``,
+		},
+		{
+			`opensearch://[::1]`,
+			`opensearch`,
+			`opensearch://[::1]`,
+			``,
+		},
+		{
+			`bq://project/dataset?location=EU`,
+			`bigquery`,
+			`bigquery://project/dataset?location=EU`,
+			``,
+		},
+		{
+			`athena://user:key@athena.us-east-1.amazonaws.com/db?workgroup=w`,
+			`athena`,
+			`athena://user:key@athena.us-east-1.amazonaws.com/db?workgroup=w`,
+			``,
+		},
+		{
+			`awsathena://bucket/db`,
+			`athena`,
+			`athena://bucket/db`,
+			``,
+		},
+		{
+			`cm://u:a2V5@account.documents.azure.com/db`,
+			`cosmos`,
+			`cosmos://u:a2V5@account.documents.azure.com/db`,
+			``,
+		},
+		{
+			`trino://host`,
+			`trino`,
+			`trino://user@host?flavor=trino`,
+			``,
+		},
+		{
+			`trino://admin:pw@host:8001/catalogname/schemaname?source=dburl`,
+			`trino`,
+			`trino://admin:pw@host:8001/catalogname/schemaname?source=dburl&flavor=trino`,
+			``,
+		},
+		{
+			`tr://host`,
+			`trino`,
+			`trino://user@host?flavor=trino`,
+			``,
+		},
+		{
+			`presto://host/catalogname/schemaname`,
+			`trino`,
+			`trino://user@host/catalogname/schemaname?flavor=presto`,
+			``,
+		},
+		{
+			`prestodb://admin:pass@host:9998/catalogname?tls=true`,
+			`trino`,
+			`trino://admin:pass@host:9998/catalogname?tls=true&flavor=presto`,
+			``,
+		},
+		{
+			`trino://admin@host/cat?flavor=presto`,
+			`trino`,
+			`trino://admin@host/cat?flavor=presto`,
+			``,
+		},
+		{
+			`presto://admin@host/cat?flavor=trino&source=x`,
+			`trino`,
+			`trino://admin@host/cat?flavor=trino&source=x`,
+			``,
+		},
+		{
+			`mc://id:key@host:8443/proj?region=r&tunnelEndpoint=t`,
+			`maxcompute`,
+			`maxcompute://id:key@host:8443/proj?region=r&tunnelEndpoint=t`,
+			``,
+		},
+		{
+			`mc://id:key@host/proj?tls=false`,
+			`maxcompute`,
+			`maxcompute://id:key@host/proj?tls=false`,
+			``,
+		},
+		{
+			`ots://user:pass@localhost/instance_name?tls=false`,
+			`tablestore`,
+			`tablestore://user:pass@localhost/instance_name?tls=false`,
+			``,
+		},
+		{
+			`tablestore://user:pass@localhost/instance_name?tls=true&requestTimeout=5s`,
+			`tablestore`,
+			`tablestore://user:pass@localhost/instance_name?tls=true&requestTimeout=5s`,
+			``,
+		},
+		{
+			`ydb://?tls=true`,
+			`ydb`,
+			`grpcs://localhost:2135/`,
+			``,
+		},
+		{
+			`ydb://user:pass@localhost:8888/?opt1=a&tls=true&opt2=b`,
+			`ydb`,
+			`grpcs://user:pass@localhost:8888/?opt1=a&opt2=b`,
+			``,
+		},
+		{
+			`ydb://host/local?tls=false&go_balancer=disable`,
+			`ydb`,
+			`grpc://host:2136/local?go_balancer=disable`,
+			``,
+		},
+		{
+			`ca://`,
+			`cassandra`,
+			`cassandra://localhost?timeout=300s`,
+			``,
+		},
+		{
+			`exa://sys@`,
+			`exasol`,
+			`exasol://sys@localhost`,
+			``,
+		},
+		{
+			`exa://user:pass@host:1883/dbname?autocommit=false`,
+			`exasol`,
+			`exasol://user:pass@host:1883/dbname?autocommit=false`,
+			``,
+		},
+		{
+			`exasol://sys:p%40ss@host/s?tls=false&fetchsize=2048`,
+			`exasol`,
+			`exasol://sys:p%40ss@host/s?tls=false&fetchsize=2048`,
+			``,
+		},
+		{
+			`mc://id:key@service.cn-hangzhou.maxcompute.aliyun.com/proj`,
+			`maxcompute`,
+			`maxcompute://id:key@service.cn-hangzhou.maxcompute.aliyun.com/proj`,
+			``,
+		},
+		{
+			`maxcompute://id:k%2Fy@host/proj`,
+			`maxcompute`,
+			`maxcompute://id:k%2Fy@host/proj`,
+			``,
+		},
+		{
+			`ot://user:pass@localhost/instance_name`,
+			`tablestore`,
+			`tablestore://user:pass@localhost/instance_name`,
+			``,
+		},
+		{
+			`ots://user:pass@localhost/instance_name`,
+			`tablestore`,
+			`tablestore://user:pass@localhost/instance_name`,
+			``,
+		},
+		{
+			`tablestore://id:secret@inst.cn-hangzhou/inst`,
+			`tablestore`,
+			`tablestore://id:secret@inst.cn-hangzhou.ots.aliyuncs.com/inst`,
+			``,
+		},
+		{
+			`tablestore://id:secret@INST.cn-hangzhou.OTS.aliyuncs.com/inst`,
+			`tablestore`,
+			`tablestore://id:secret@INST.cn-hangzhou.OTS.aliyuncs.com/inst`,
+			``,
+		},
+		{
+			`tablestore://id:secret@inst.vpc.cn-hangzhou.ots.aliyuncs.com:443/inst`,
+			`tablestore`,
+			`tablestore://id:secret@inst.vpc.cn-hangzhou.ots.aliyuncs.com:443/inst`,
+			``,
+		},
+		{
+			`tablestore://id:secret@10.0.0.1/inst`,
+			`tablestore`,
+			`tablestore://id:secret@10.0.0.1/inst`,
+			``,
+		},
+		{
+			`bend://user:pass@localhost/instance_name?sslmode=disabled&warehouse=wh`,
+			`databend`,
+			`databend://user:pass@localhost/instance_name?sslmode=disabled&warehouse=wh`,
+			``,
+		},
+		{
+			`databend://user:pass@localhost/instance_name?tenant=tn&warehouse=wh`,
+			`databend`,
+			`databend://user:pass@localhost/instance_name?tenant=tn&warehouse=wh`,
+			``,
+		},
+		{
+			`flightsql://user:pass@localhost?timeout=3s&token=foobar&tls=enabled`,
+			`flightsql`,
+			`flightsql://user:pass@localhost?timeout=3s&token=foobar&tls=enabled`,
+			``,
+		},
+		{
+			`duckdb:/path/to/foo.db?access_mode=read_only&threads=4`,
+			`duckdb`,
+			`/path/to/foo.db?access_mode=read_only&threads=4`,
+			``,
+		},
+		{
+			`dk:///path/to/foo.db?access_mode=read_only&threads=4`,
+			`duckdb`,
+			`/path/to/foo.db?access_mode=read_only&threads=4`,
+			``,
+		},
+		{
+			`duckdb://`,
+			`duckdb`,
+			``,
+			``,
+		},
+		{
+			`duckdb://:memory:`,
+			`duckdb`,
+			`:memory:`,
+			``,
+		},
+		{
+			`duckdb:?threads=4`,
+			`duckdb`,
+			`?threads=4`,
+			``,
+		},
+		{
+			`file:./testdata/test.sqlite3?a=b`,
+			`sqlite3`,
+			`./testdata/test.sqlite3?_loc=auto&a=b`,
+			``,
+		},
+		{
+			`file:./testdata/test.duckdb?a=b`,
+			`duckdb`,
+			`./testdata/test.duckdb?a=b`,
+			``,
+		},
+		{
+			`file:__nonexistent__.db`,
+			`sqlite3`,
+			`__nonexistent__.db?_loc=auto`,
+			``,
+		},
+		{
+			`file:__nonexistent__.sqlite3`,
+			`sqlite3`,
+			`__nonexistent__.sqlite3?_loc=auto`,
+			``,
+		},
+		{
+			`file:__nonexistent__.duckdb`,
+			`duckdb`,
+			`__nonexistent__.duckdb`,
+			``,
+		},
+		{
+			`__nonexistent__.db`,
+			`sqlite3`,
+			`__nonexistent__.db?_loc=auto`,
+			``,
+		},
+		{
+			`__nonexistent__.sqlite3`,
+			`sqlite3`,
+			`__nonexistent__.sqlite3?_loc=auto`,
+			``,
+		},
+		{
+			`__nonexistent__.duckdb`,
+			`duckdb`,
+			`__nonexistent__.duckdb`,
+			``,
+		},
+		{
+			`file:fake.sqlite3?a=b`,
+			`sqlite3`,
+			`fake.sqlite3?_loc=auto&a=b`,
+			``,
+		},
+		{
+			`fake.sq`,
+			`sqlite3`,
+			`fake.sq?_loc=auto`,
+			``,
+		},
+		{
+			`file:fake.duckdb?a=b`,
+			`duckdb`,
+			`fake.duckdb?a=b`,
+			``,
+		},
+		{
+			`fake.dk`,
+			`duckdb`,
+			`fake.dk`,
+			``,
+		},
+		{
+			`file:/var/run/mysqld/mysqld.sock/mydb?timeout=90`,
+			`mysql`,
+			`unix(/var/run/mysqld/mysqld.sock)/mydb?loc=Local&parseTime=true&sql_mode=ansi&timeout=90`,
+			`/var/run/mysqld/mysqld.sock`,
+		},
+		{
+			`file:/var/run/postgresql`,
+			`pgx`,
+			`postgres://?host=%2Fvar%2Frun%2Fpostgresql`,
+			`/var/run/postgresql`,
+		},
+		{
+			`file:/var/run/postgresql:6666/mydb`,
+			`pgx`,
+			`postgres:///mydb?host=%2Fvar%2Frun%2Fpostgresql&port=6666`,
+			`/var/run/postgresql`,
+		},
+		{
+			`file:/var/run/postgresql/mydb`,
+			`pgx`,
+			`postgres:///mydb?host=%2Fvar%2Frun%2Fpostgresql`,
+			`/var/run/postgresql`,
+		},
+		{
+			`file:/var/run/postgresql:7777`,
+			`pgx`,
+			`postgres://?host=%2Fvar%2Frun%2Fpostgresql&port=7777`,
+			`/var/run/postgresql`,
+		},
+		{
+			`file://user:pass@/var/run/postgresql/mydb`,
+			`pgx`,
+			`postgres://user:pass@/mydb?host=%2Fvar%2Frun%2Fpostgresql`,
+			`/var/run/postgresql`,
+		},
+		{
+			`hive://myhost/mydb`,
+			`hive`,
+			`hive://myhost/mydb`,
+			``,
+		},
+		{
+			`hive://myhost`,
+			`hive`,
+			`hive://myhost`,
+			``,
+		},
+		{
+			`hive://`,
+			`hive`,
+			`hive://localhost`,
+			``,
+		},
+		{
+			`hive://myhost:9999/mydb?httpPath=cliservice&tls=true`,
+			`hive`,
+			`hive://myhost:9999/mydb?httpPath=cliservice&tls=true`,
+			``,
+		},
+		{
+			`hive2://user:p%40ss@myhost:9999/mydb`,
+			`hive`,
+			`hive://user:p%40ss@myhost:9999/mydb`,
+			``,
+		},
+		{
+			`impala://user:pass@myhost/mydb`,
+			`hive`,
+			`hive://user:pass@myhost:28000/mydb`,
+			``,
+		},
+		{
+			`im://myhost:21050`,
+			`hive`,
+			`hive://myhost:21050`,
+			``,
+		},
+		{
+			`impala://`,
+			`hive`,
+			`hive://localhost:28000`,
+			``,
+		},
+		{
+			`dy://user:pass@dynamodb.us-east-1.amazonaws.com?region=us-east-1`,
+			`dynamodb`,
+			`dynamodb://user:pass@dynamodb.us-east-1.amazonaws.com?region=us-east-1`,
+			``,
+		},
+		{
+			`dy://AK:sk@dynamodb.us-east-1.amazonaws.com?region=us-east-1&token=T`,
+			`dynamodb`,
+			`dynamodb://AK:sk@dynamodb.us-east-1.amazonaws.com?region=us-east-1&token=T`,
+			``,
+		},
+		{
+			`dynamodb://AKID:s%2Fk@localhost:8000?region=local&tls=false`,
+			`dynamodb`,
+			`dynamodb://AKID:s%2Fk@localhost:8000?region=local&tls=false`,
+			``,
+		},
+		{
+			`br://token:key@host.cloud.databricks.com/wh`,
+			`databricks`,
+			`databricks://token:key@host.cloud.databricks.com/wh`,
+			``,
+		},
+		{
+			`brick://token:pat@host.cloud.databricks.com:8443/wh?timeout=5m&catalog=c`,
+			`databricks`,
+			`databricks://token:pat@host.cloud.databricks.com:8443/wh?timeout=5m&catalog=c`,
+			``,
+		},
+		{
+			`br://token:pat@dbc-1234/wh?timeout=1m`,
+			`databricks`,
+			`databricks://token:pat@dbc-1234.cloud.databricks.com/wh?timeout=1m`,
+			``,
+		},
+		{
+			`br://token:pat@adb-1.2.azuredatabricks.net/wh`,
+			`databricks`,
+			`databricks://token:pat@adb-1.2.azuredatabricks.net/wh`,
+			``,
+		},
+		{
+			`databricks://token:pat@DBC-1234.Cloud.Databricks.COM/wh`,
+			`databricks`,
+			`databricks://token:pat@DBC-1234.Cloud.Databricks.COM/wh`,
+			``,
+		},
+		{
+			`databricks://token:pat@localhost:8443/wh`,
+			`databricks`,
+			`databricks://token:pat@localhost:8443/wh`,
+			``,
+		},
+		{
+			`cm://u:a2V5@account/db`,
+			`cosmos`,
+			`cosmos://u:a2V5@account.documents.azure.com/db`,
+			``,
+		},
+		{
+			`cm://u:a2V5@account.documents.azure.us/db`,
+			`cosmos`,
+			`cosmos://u:a2V5@account.documents.azure.us/db`,
+			``,
+		},
+		{
+			`athena://AK:sk@us-east-1/db?workgroup=w`,
+			`athena`,
+			`athena://AK:sk@athena.us-east-1.amazonaws.com/db?workgroup=w`,
+			``,
+		},
+		{
+			`aws://AK:sk@athena.eu-west-2.amazonaws.com/db`,
+			`athena`,
+			`athena://AK:sk@athena.eu-west-2.amazonaws.com/db`,
+			``,
+		},
+		{
+			`athena://localhost:8080/db`,
+			`athena`,
+			`athena://localhost:8080/db`,
+			``,
+		},
+		{
+			`athena://AK:sk@US-GOV-WEST-1`,
+			`athena`,
+			`athena://AK:sk@athena.us-gov-west-1.amazonaws.com`,
+			``,
+		},
+		{
+			`dy://AK:sk@us-east-1`,
+			`dynamodb`,
+			`dynamodb://AK:sk@dynamodb.us-east-1.amazonaws.com?region=us-east-1`,
+			``,
+		},
+		{
+			`dy://AK:sk@us-east-1?token=T&tls=false`,
+			`dynamodb`,
+			`dynamodb://AK:sk@dynamodb.us-east-1.amazonaws.com?token=T&tls=false&region=us-east-1`,
+			``,
+		},
+		{
+			`dy://AK:sk@us-east-1?region=us-west-2`,
+			`dynamodb`,
+			`dynamodb://AK:sk@dynamodb.us-east-1.amazonaws.com?region=us-west-2`,
+			``,
+		},
+		{
+			`bq://my-project/EU/dataset?credential_file=/k.json`,
+			`bigquery`,
+			`bigquery://my-project/EU/dataset?credential_file=/k.json`,
+			``,
+		},
+		{
+			`mysql://u:p@h/db?parseTime=false&loc=UTC&sql_mode=traditional`,
+			`mysql`,
+			`u:p@tcp(h)/db?loc=UTC&parseTime=false&sql_mode=traditional`,
+			``,
+		},
+		{
+			`tidb://u:p@h/db?loc=Asia%2FJakarta`,
+			`mysql`,
+			`u:p@tcp(h:4000)/db?loc=Asia%2FJakarta&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`vitess://u:p@h/db?sql_mode=`,
+			`mysql`,
+			`u:p@tcp(h)/db?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`memsql://h/db`,
+			`mysql`,
+			`tcp(h)/db?loc=Local&parseTime=true&sql_mode=ansi`,
+			``,
+		},
+		{
+			`sqlite3:/tmp/f.db`,
+			`sqlite3`,
+			`/tmp/f.db?_loc=auto`,
+			``,
+		},
+		{
+			`cassandra://h?timeout=5s`,
+			`cassandra`,
+			`cassandra://h?timeout=5s`,
+			``,
+		},
+		{
+			`couchbase://h?txtimeout=1h`,
+			`couchbase`,
+			`couchbase://h?txtimeout=1h`,
+			``,
+		},
+		{
+			`sqlite3:/tmp/f.db?_loc=UTC`,
+			`sqlite3`,
+			`/tmp/f.db?_loc=UTC`,
+			``,
+		},
+		{
+			`moderncsqlite:/tmp/f.db?_timezone=UTC`,
+			`sqlite`,
+			`/tmp/f.db?_timezone=UTC`,
+			``,
+		},
+		{
+			`moderncsqlite:/tmp/f.db`,
+			`sqlite`,
+			`/tmp/f.db?_timezone=Local`,
+			``,
+		},
+		{
+			`ydb://`,
+			`ydb`,
+			`grpc://localhost:2136/`,
+			``,
+		},
+		{
+			`clickhouse://user:pass@localhost/db?tls=true`,
+			`clickhouse`,
+			`clickhouse://user:pass@localhost/db?tls=true`,
+			``,
+		},
+		{
+			`ch://user:pass@host:8443/`,
+			`clickhouse`,
+			`clickhouse://user:pass@host:8443/`,
+			``,
+		},
+		{
+			`clickhouse://`,
+			`clickhouse`,
+			`clickhouse://localhost`,
+			``,
+		},
+	}
+	m := make(map[string]bool)
+	for i, test := range tests {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			if _, ok := m[test.s]; ok {
+				t.Fatalf("%s is already tested", test.s)
+			}
+			m[test.s] = true
+			testParse(t, test.s, test.d, test.exp, test.path)
+		})
+	}
+}
+
+func testParse(t *testing.T, s, d, exp, path string) {
+	t.Helper()
+	u, err := Parse(s)
+	switch {
+	case err != nil:
+		t.Errorf("%q expected no error, got: %v", s, err)
+	case u.Driver != d:
+		t.Errorf("%q expected driver %q, got: %q", s, d, u.Driver)
+	case u.DSN != exp:
+		_, err := Stat(path)
+		if path != "" && err != nil && os.IsNotExist(err) {
+			t.Logf("%q expected dsn %q, got: %q -- ignoring because `%s` does not exist", s, exp, u.DSN, path)
+		} else {
+			t.Errorf("%q expected:\n%q\ngot:\n%q", s, exp, u.DSN)
+		}
+	}
+}
+
+func TestBuildURL(t *testing.T) {
+	tests := []struct {
+		m   map[string]any
+		exp string
+		err error
+	}{
+		{nil, "", ErrInvalidDatabaseScheme},
+		{
+			map[string]any{
+				"proto":     "mysql",
+				"transport": "tcp",
+				"host":      "localhost",
+				"port":      999,
+				"q": map[string]any{
+					"foo":  "bar",
+					"opt1": "b",
+				},
+			},
+			"mysql+tcp://localhost:999?foo=bar&opt1=b", nil,
+		},
+		{
+			map[string]any{
+				"proto":    "sqlserver",
+				"host":     "localhost",
+				"port":     "5555",
+				"instance": "instance",
+				"database": "dbname",
+				"q": map[string]any{
+					"foo":  "bar",
+					"opt1": "b",
+				},
+			},
+			"sqlserver://localhost:5555/instance/dbname?foo=bar&opt1=b", nil,
+		},
+		{
+			map[string]any{
+				"proto":    "pg",
+				"host":     "host name",
+				"user":     "user name",
+				"password": "P!!!@@@@ 👀",
+				"database": "my awesome db",
+				"q": map[string]any{
+					"foo":  "bar is cool",
+					"opt1": "b zzzz@@@:/",
+				},
+			},
+			"pg://user%20name:P%21%21%21%40%40%40%40%20%F0%9F%91%80@host+name/my%20awesome%20db?foo=bar+is+cool&opt1=b+zzzz%40%40%40%3A%2F", nil,
+		},
+		{
+			map[string]any{
+				"file": "fake.sqlite3",
+				"q": map[string]any{
+					"foo":  "bar",
+					"opt1": "b",
+				},
+			},
+			"file:fake.sqlite3?foo=bar&opt1=b", nil,
+		},
+	}
+	for i, test := range tests {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			switch s, err := BuildURL(test.m); {
+			case err != nil && !errors.Is(err, test.err):
+				t.Fatalf("expected error %v, got: %v", test.err, err)
+			case err != nil && test.err == nil:
+				t.Fatalf("expected no error, got: %v", err)
+			case s != test.exp:
+				t.Errorf("expected %q, got: %q", test.exp, s)
+			default:
+				t.Logf("dsn: %q", s)
+			}
+			switch u, err := FromMap(test.m); {
+			case err != nil:
+				t.Logf("parse error: %v", err)
+			default:
+				t.Logf("url: %q", u.String())
+			}
+		})
+	}
+}
+
+func TestBuildURLUserinfo(t *testing.T) {
+	tests := []struct {
+		name string
+		user string
+		pass string
+		set  bool
+		has  bool
+	}{
+		{"username space", "user name", "", false, false},
+		{"password space", "user", "p w", true, true},
+		{"both spaces", "user name", "p w", true, true},
+		{"plus", "user+name", "p+w", true, true},
+		{"reserved", "user:@/?#%&=", "p:@/?#%&=", true, true},
+		{"unicode", "us\u00e9r\u00a0name", "p\t\u00e4ss word", true, true},
+		{"no password", "user", "", false, false},
+		{"empty password", "user", "", true, false},
+		{"leading and trailing spaces", " user ", " p ", true, true},
+		{"username reserved", "user:@", "", false, false},
+	}
+	for _, keys := range [][2]string{{"username", "password"}, {"user", "pass"}} {
+		for _, test := range tests {
+			t.Run(keys[0]+"/"+test.name, func(t *testing.T) {
+				m := map[string]any{
+					"proto":  "postgres",
+					"host":   "localhost",
+					keys[0]:  test.user,
+					"dbname": "app",
+				}
+				if test.set {
+					m[keys[1]] = test.pass
+				}
+				s, err := BuildURL(m)
+				if err != nil {
+					t.Fatal(err)
+				}
+				v, err := url.Parse(s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				u, err := FromMap(m)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, user := range []*url.Userinfo{v.User, u.User} {
+					if user == nil {
+						t.Fatal("expected user information")
+					}
+					if got := user.Username(); got != test.user {
+						t.Errorf("expected username %q, got: %q", test.user, got)
+					}
+					if pass, set := user.Password(); pass != test.pass || set != test.has {
+						t.Errorf("expected password %q, present %t, got: %q, present %t", test.pass, test.has, pass, set)
+					}
+				}
+			})
+		}
+	}
+}
+
+func init() {
+	statFile, openFile := Stat, OpenFile
+	Stat = func(name string) (fs.FileInfo, error) {
+		if s, ok := newStat(name); ok {
+			return s, nil
+		}
+		return statFile(name)
+	}
+	OpenFile = func(name string) (fs.File, error) {
+		if s, ok := newStat(name); ok {
+			return s, nil
+		}
+		return openFile(name)
+	}
+}
+
+type stat struct {
+	name    string
+	mode    fs.FileMode
+	content string
+}
+
+func newStat(name string) (stat, bool) {
+	const (
+		sqlite3Header = "SQLite format 3\000.........."
+		// a checksum as duckdb writes it. It holds the valid UTF-8 sequence
+		// \xc2\xda and a \n. A rune based matcher steps over neither one
+		// correctly.
+		duckdbHeader = "\x06\xd7\x6f\x0a\xc2\xda\xb3\xb9DUCK\x40\x00\x00\x00......"
+	)
+	files := map[string]string{
+		"fake.sqlite3": sqlite3Header,
+		"fake.sq":      sqlite3Header,
+		"fake.duckdb":  duckdbHeader,
+		"fake.dk":      duckdbHeader,
+		"fake.unknown": "not a database header......................",
+	}
+	switch name {
+	case "/var/run/postgresql":
+		return stat{name, fs.ModeDir, ""}, true
+	case "/var/run/mysqld/mysqld.sock":
+		return stat{name, fs.ModeSocket, ""}, true
+	case "fake.sqlite3", "fake.sq", "fake.duckdb", "fake.dk", "fake.unknown":
+		return stat{name, 0, files[name]}, true
+	}
+	return stat{}, false
+}
+
+func (s stat) Name() string       { return s.name }
+func (s stat) Size() int64        { return int64(len(s.content)) }
+func (s stat) Mode() fs.FileMode  { return s.mode }
+func (s stat) ModTime() time.Time { return time.Now() }
+func (s stat) IsDir() bool        { return s.mode&fs.ModeDir != 0 }
+func (s stat) Sys() any           { return nil }
+func (s stat) Close() error       { return nil }
+
+func (s stat) Stat() (fs.FileInfo, error) {
+	return s, nil
+}
+
+func (s stat) Read(b []byte) (int, error) {
+	v := []byte(s.content)
+	copy(b, v)
+	return len(v), nil
+}
+
+// TestSchemeDefaults holds D65. A scheme adds each default option that the URL
+// does not give, a value that the URL gives wins, and the URL keeps its own
+// query.
+func TestSchemeDefaults(t *testing.T) {
+	t.Parallel()
+	u, err := Parse(`mysql://user:pass@host/db?loc=UTC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exp := `mysql://user:pass@host/db?loc=UTC`; u.String() != exp {
+		t.Errorf("expected String %q, got: %q", exp, u.String())
+	}
+	if exp := `loc=UTC`; u.RawQuery != exp {
+		t.Errorf("expected RawQuery %q, got: %q", exp, u.RawQuery)
+	}
+	if exp := `user:pass@tcp(host)/db?loc=UTC&parseTime=true&sql_mode=ansi`; u.DSN != exp {
+		t.Errorf("expected DSN %q, got: %q", exp, u.DSN)
+	}
+	for _, name := range []string{"mysql", "tidb", "memsql", "vitess", "sqlite3", "cassandra", "couchbase"} {
+		if len(schemeMap[name].Defaults) == 0 {
+			t.Errorf("expected defaults for scheme %s", name)
+		}
+	}
+	for name, scheme := range schemeMap {
+		if scheme.Name != name {
+			continue
+		}
+		for k, v := range scheme.Defaults {
+			if k == "" || v == "" {
+				t.Errorf("scheme %s has an empty default %q=%q", name, k, v)
+			}
+		}
+	}
+}
+
+func TestOpenForward(t *testing.T) {
+	t.Parallel()
+	for _, s := range []string{`k8s+postgres://user:pass@pod.ns/db`, `k8+cnpg://pod/db`, `k+mysql://pod/db`, `k://pg-rw.prod/`} {
+		u, err := Parse(s)
+		if err != nil {
+			t.Fatalf("%q expected no error, got: %v", s, err)
+		}
+		switch {
+		case u.SchemeName != "k8s":
+			t.Errorf("%q expected scheme k8s, got: %q", s, u.SchemeName)
+		case strings.Contains(s, "+") == (u.Transport == ""):
+			t.Errorf("%q expected a transport only with a +type, got: %q", s, u.Transport)
+		case u.DSN != "":
+			t.Errorf("%q expected no DSN, got: %q", s, u.DSN)
+		}
+		if _, err := Open(s); !errors.Is(err, ErrUnresolvedForward) {
+			t.Errorf("%q expected %v, got: %v", s, ErrUnresolvedForward, err)
+		}
+	}
+}
+
+// TestForwardUserinfo checks that a forward URL keeps the difference between
+// secret@ and secret:@, which dbfwd reads as a database user and as a Secret
+// with the key password.
+func TestForwardUserinfo(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		s, user, pass string
+		set           bool
+	}{
+		{`k8s+cnpg://secret@c.ns/db`, "secret", "", false},
+		{`k8s+cnpg://secret:@c.ns/db`, "secret", "", true},
+		{`k8s+cnpg://secret:key@c.ns/db?context=a%3Ab`, "secret", "key", true},
+		{`k8s+cnpg://c.ns/db`, "", "", false},
+	}
+	for _, test := range tests {
+		u, err := Parse(test.s)
+		if err != nil {
+			t.Fatalf("%q expected no error, got: %v", test.s, err)
+		}
+		pass, set := u.User.Password()
+		if u.User.Username() != test.user || pass != test.pass || set != test.set {
+			t.Errorf("%q expected %q, %q, %t, got: %q, %q, %t", test.s, test.user, test.pass, test.set, u.User.Username(), pass, set)
+		}
+		if v := u.String(); v != test.s {
+			t.Errorf("%q expected String %q, got: %q", test.s, test.s, v)
+		}
+	}
+}
+
+// TestWindowsDriveK documents that k is an alias of k8s, so a Windows path on
+// the drive K: parses as that scheme and not as a file. It is an error. A user
+// of such a drive writes the path as file:///K:/..., which is accepted.
+func TestWindowsDriveK(t *testing.T) {
+	t.Parallel()
+	for _, s := range []string{`K:\data\x.db`, `k:/data/x.db`} {
+		if _, err := Parse(s); err == nil {
+			t.Errorf("%q expected an error, got none", s)
+		}
+	}
+}
+
+func TestForwardNoType(t *testing.T) {
+	t.Parallel()
+	u, err := Parse(`k://pg-rw.prod/app`)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if u.Transport != "" || u.String() != `k://pg-rw.prod/app` {
+		t.Errorf("expected no transport and the same URL, got: %q and %q", u.Transport, u.String())
+	}
+	if s := u.Short(); s != `k:pg-rw.prod/app` {
+		t.Errorf("expected k:pg-rw.prod/app, got: %q", s)
+	}
+	if s := u.Normalize(":", "", 0); strings.Contains(s, "+") {
+		t.Errorf("expected no + in %q", s)
+	}
+}

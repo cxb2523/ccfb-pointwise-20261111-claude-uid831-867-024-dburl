@@ -1,0 +1,39 @@
+# Backlog
+
+This document lists work that is known and not done. Each item names the
+decision or the fact that found it.
+
+A decision is not a backlog item. It goes in [`PLAN.md`](PLAN.md). When an
+item here is done, delete it, and record in `PLAN.md` anything that was
+decided on the way (D27).
+
+## Schemes
+
+### Add the schemes for the next dbimp drivers
+
+dbimp D73 set the order of the drivers after Neo4j, and each of them is done:
+InfluxDB (D29), CrateDB on pgx (D30), ArangoDB (D32), Databend (D39), Pinot
+(D43), rqlite (D44), libSQL with Turso (D45), Avatica (D47) and Druid (D48).
+TDengine got no driver, and its scheme is removed (D41). Drill, Solr,
+Elasticsearch, OpenSearch and DynamoDB followed (D54 and D55), and dbimp tagged
+them in `v0.14.0`. When dbimp starts another driver, add its scheme when the
+driver has `ParseDSN` at a tag, under rule 3.
+
+### Check the five drivers at v0.17.0
+
+D63 checked `athena`, `bigquery`, `cosmos`, `databricks` and `spanner` against
+dbimp at commit `348c9eb7`, and dbimp says `v0.17.0` will not change them. When
+it is tagged, run each generator through the tagged `ParseDSN`, release, and
+tell `usql` and `dbmeta` the tag. `dbmeta` reads the `Dialect`, which changes
+from `awsathena` to `athena`.
+
+### Decide the generators that fill a missing field
+
+D38 says a generator returns an error for a required field that the URL
+lacks. Two generators fill one in instead:
+
+- `GenTrino` and `GenPresto` write the user `user` when the URL has none, which
+  D50 decided, as the old generators did.
+
+`GenPresto` and `GenTrino` made the catalog `default` until D50. `GenHive` made
+the database `default` until D74.
